@@ -1,0 +1,4 @@
+.venv/
+.mpl-cache/
+__pycache__/
+results/
