@@ -4,11 +4,16 @@ This project trains a shared-policy multi-agent PPO controller in a 3D environme
 
 - velocity and acceleration 2-norm limits
 - randomly sampled training objectives
+- randomized training obstacles plus fixed and generalized evaluation
 - fixed evaluation objectives
-- Gaussian objective rewards with per-objective amplitudes and variances
-- ordinal task completion penalties
+- completion-dominant rewards with small Gaussian shaping
+- explicit per-agent target assignment for local progress shaping
+- explicit assignment features in each agent observation
+- team-level objective completion in the shortest possible timeframe
 - obstacle penalties
-- training curves and a 3D rollout animation
+- imitation warm start from an assignment-based expert controller
+- PPO minibatching, observation normalization, and bounded tanh-squashed actions
+- fixed-map and randomized-map evaluation, training curves, and a 3D rollout animation
 
 ## Setup
 
@@ -20,13 +25,13 @@ python3 -m venv .venv
 ## Run
 
 ```bash
-.venv/bin/python train_swarm_ppo.py --episodes 250 --steps-per-episode 150
+.venv/bin/python train_swarm_ppo.py --episodes 250 --steps-per-episode 150 --rollouts-per-update 6
 ```
 
-If you want a coordination-friendly shaping variant while keeping the rest of the setup the same:
+For a longer run with the full curriculum:
 
 ```bash
-.venv/bin/python train_swarm_ppo.py --reward-aggregation max_agents --completion-bonus-scale 4.0
+.venv/bin/python train_swarm_ppo.py --episodes 600 --curriculum-episodes 200 --eval-episodes 8
 ```
 
 Outputs are written to `results/<timestamp>/`:
@@ -38,5 +43,7 @@ Outputs are written to `results/<timestamp>/`:
 
 ## Notes
 
-- The environment defaults to your requested reward form: sum of active objective Gaussians, plus a small per-step time penalty and obstacle / out-of-order penalties.
-- If you want stronger specialization between agents, the next reward change worth testing is swapping from a sum over all agents to a per-objective max-over-agents contribution.
+- The training reward treats objectives as unordered. Any agent can complete any remaining objective, and the reward is now dominated by completion bonuses and a strong time penalty.
+- Training now begins with a short behavior-cloning warm start from a simple assignment-based expert, then fine-tunes with PPO.
+- The script evaluates both a fixed canonical scenario and randomized unseen scenarios each training iteration.
+- See [understanding.md](/Users/jackcook/Desktop/Personal_projects/Swarm/understanding.md) for a summary of the changes and the reasoning behind them.
