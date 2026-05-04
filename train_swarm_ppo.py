@@ -1225,6 +1225,8 @@ def train(args: argparse.Namespace) -> None:
     phase2_allowed = not args.require_phase1_generalization_improvement
     phase1_gate_checked = False
     early_stop_reason = ""
+    best_episode = -1
+    episodes_since_best = 0
 
     for episode in range(args.episodes):
         if phase2_enabled and not phase2_allowed and episode >= ppo_phase_start:
@@ -1301,6 +1303,8 @@ def train(args: argparse.Namespace) -> None:
         current_key = best_metric_tuple(fixed_metrics, random_metrics)
         if current_key > best_key:
             best_key = current_key
+            best_episode = episode + 1
+            episodes_since_best = 0
             best_fixed_metrics = fixed_metrics
             best_general_metrics = random_metrics
             rollout_env = Swarm3DEnv(env_cfg)
@@ -1318,6 +1322,8 @@ def train(args: argparse.Namespace) -> None:
                     "curriculum_difficulty": difficulty,
                 },
             )
+        else:
+            episodes_since_best += 1
 
         checkpoint_record = {
             "episode": episode + 1,
@@ -1343,6 +1349,10 @@ def train(args: argparse.Namespace) -> None:
         for existing_checkpoint in checkpoints_dir.glob("episode_*.pt"):
             if existing_checkpoint.resolve() not in retained_paths:
                 existing_checkpoint.unlink(missing_ok=True)
+
+        if args.early_stop_patience > 0 and episodes_since_best >= args.early_stop_patience:
+            early_stop_reason = "no_checkpoint_improvement"
+            break
 
         if (
             not phase1_gate_checked
@@ -1384,6 +1394,7 @@ def train(args: argparse.Namespace) -> None:
         "ppo_config": asdict(ppo_cfg),
         "best_fixed_metrics": best_fixed_metrics,
         "best_generalization_metrics": best_general_metrics,
+        "best_episode": best_episode,
         "pretrain_fixed_metrics": pretrain_fixed_metrics,
         "pretrain_generalization_metrics": pretrain_random_metrics,
         "top_checkpoints": top_checkpoints,
@@ -1488,6 +1499,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1-min-general-success-gain", type=float, default=0.05)
     parser.add_argument("--phase1-min-general-completion-gain", type=float, default=0.05)
     parser.add_argument("--top-k-checkpoints", type=int, default=5)
+    parser.add_argument("--early-stop-patience", type=int, default=80)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")

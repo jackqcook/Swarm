@@ -15,6 +15,7 @@ This project trains a shared-policy multi-agent PPO controller in a 3D environme
 - staged PPO refinement with a phase-1 generalization gate
 - BC-retention regularization to reduce post-cloning policy drift
 - mixed-difficulty curriculum sampling and top-k checkpoint retention
+- patience-based early stopping when no better checkpoint appears
 - PPO minibatching, observation normalization, and bounded tanh-squashed actions
 - fixed-map and randomized-map evaluation, training curves, and a 3D rollout animation
 
@@ -50,5 +51,6 @@ Outputs are written to `results/<timestamp>/`:
 - Training now begins with a short behavior-cloning warm start from a simple assignment-based expert, then fine-tunes with PPO.
 - PPO fine-tuning is split into a short conservative phase and a longer refinement phase, and phase 2 only proceeds if generalized evaluation improves over the BC baseline.
 - The trainer now keeps the top-k checkpoints under `results/<timestamp>/checkpoints/` so the best intermediate policies are not lost when later updates drift.
+- Longer runs now stop early when the checkpoint leaderboard stagnates, which is meant to prevent late-stage degradation from overwriting a good training window.
 - The script evaluates both a fixed canonical scenario and randomized unseen scenarios each training iteration.
 - See [understanding.md](/Users/jackcook/Desktop/Personal_projects/Swarm/understanding.md) for a summary of the changes and the reasoning behind them.

@@ -58,6 +58,7 @@ The trainer was upgraded in several ways:
 - PPO fine-tuning is split into a short conservative phase followed by a longer refinement phase
 - phase 2 can be gated on generalized improvement over the BC baseline
 - a KL-style retention term can keep PPO from drifting too far from the cloned policy
+- long runs can stop early when the top checkpoint has not improved for a configured patience window
 - multiple rollouts are now collected per PPO update
 - PPO now trains with minibatches rather than one monolithic batch
 - time-limit truncations are now bootstrapped with the critic instead of being forced to zero
@@ -110,7 +111,7 @@ The checkpoint selection logic was also improved. The saved “best” model is 
 7. lower remaining coverage cost
 8. lower generalized remaining coverage cost
 
-The trainer also keeps a top-k leaderboard of checkpoint files instead of only a single best model. That matters because PPO can discover a strong policy and then partially degrade it later, especially once the curriculum gets harder.
+The trainer also keeps a top-k leaderboard of checkpoint files instead of only a single best model. That matters because PPO can discover a strong policy and then partially degrade it later, especially once the curriculum gets harder. A patience-based early-stop rule now uses that leaderboard to halt long runs once the best checkpoint window appears to be over.
 
 ## Why These Changes Should Help
 

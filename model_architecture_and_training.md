@@ -493,6 +493,8 @@ This is important because a naïve checkpoint rule can preserve the wrong model,
 
 The trainer also keeps the top-k checkpoints on disk, rather than only one best snapshot. That matters because the most transferable policy may appear mid-run and should still be available even if later training drifts.
 
+The trainer can also stop early when that top-checkpoint leaderboard has not improved for a configured patience window. In practice this is a guard against the specific failure mode where longer PPO training destroys a previously strong generalizing policy.
+
 ## What the Current Model Is Good At
 
 With the latest changes, the system can now:
