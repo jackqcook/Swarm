@@ -12,6 +12,9 @@ This project trains a shared-policy multi-agent PPO controller in a 3D environme
 - team-level objective completion in the shortest possible timeframe
 - obstacle penalties
 - imitation warm start from an assignment-based expert controller
+- staged PPO refinement with a phase-1 generalization gate
+- BC-retention regularization to reduce post-cloning policy drift
+- mixed-difficulty curriculum sampling and top-k checkpoint retention
 - PPO minibatching, observation normalization, and bounded tanh-squashed actions
 - fixed-map and randomized-map evaluation, training curves, and a 3D rollout animation
 
@@ -31,7 +34,7 @@ python3 -m venv .venv
 For a longer run with the full curriculum:
 
 ```bash
-.venv/bin/python train_swarm_ppo.py --episodes 600 --curriculum-episodes 200 --eval-episodes 8
+.venv/bin/python train_swarm_ppo.py --episodes 600 --curriculum-episodes 200 --eval-episodes 8 --top-k-checkpoints 5
 ```
 
 Outputs are written to `results/<timestamp>/`:
@@ -45,5 +48,7 @@ Outputs are written to `results/<timestamp>/`:
 
 - The training reward treats objectives as unordered. Any agent can complete any remaining objective, and the reward is now dominated by completion bonuses and a strong time penalty.
 - Training now begins with a short behavior-cloning warm start from a simple assignment-based expert, then fine-tunes with PPO.
+- PPO fine-tuning is split into a short conservative phase and a longer refinement phase, and phase 2 only proceeds if generalized evaluation improves over the BC baseline.
+- The trainer now keeps the top-k checkpoints under `results/<timestamp>/checkpoints/` so the best intermediate policies are not lost when later updates drift.
 - The script evaluates both a fixed canonical scenario and randomized unseen scenarios each training iteration.
 - See [understanding.md](/Users/jackcook/Desktop/Personal_projects/Swarm/understanding.md) for a summary of the changes and the reasoning behind them.

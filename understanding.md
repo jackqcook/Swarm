@@ -55,6 +55,9 @@ The observation now also includes the agent's current assigned objective as an e
 The trainer was upgraded in several ways:
 
 - training begins with behavior cloning from a simple expert that greedily accelerates each agent toward its current assignment
+- PPO fine-tuning is split into a short conservative phase followed by a longer refinement phase
+- phase 2 can be gated on generalized improvement over the BC baseline
+- a KL-style retention term can keep PPO from drifting too far from the cloned policy
 - multiple rollouts are now collected per PPO update
 - PPO now trains with minibatches rather than one monolithic batch
 - time-limit truncations are now bootstrapped with the critic instead of being forced to zero
@@ -72,7 +75,7 @@ Training now uses a curriculum:
 
 - early episodes sample agents and objectives from a smaller spatial region
 - obstacle layouts are randomized during training
-- difficulty ramps up over `--curriculum-episodes`
+- difficulty can either ramp monotonically or be sampled from a mixed-difficulty band under the current curriculum ceiling
 
 Evaluation is explicit:
 
@@ -107,7 +110,7 @@ The checkpoint selection logic was also improved. The saved “best” model is 
 7. lower remaining coverage cost
 8. lower generalized remaining coverage cost
 
-That makes the saved rollout more representative of the best policy observed during training.
+The trainer also keeps a top-k leaderboard of checkpoint files instead of only a single best model. That matters because PPO can discover a strong policy and then partially degrade it later, especially once the curriculum gets harder.
 
 ## Why These Changes Should Help
 
@@ -123,8 +126,8 @@ The new setup addresses the original failure mode directly:
 
 If performance is still weak after a longer run, the next upgrades worth trying are:
 
-- stronger progress reward and completion bonus
-- longer training with more rollouts per update
+- adaptive early stopping or checkpoint rollback when generalized metrics degrade
+- stronger regularization against post-BC drift
+- longer training with more seeds rather than relying on a single run
 - recurrent or attention-based policies for richer coordination
-- explicit assignment logic between agents and objectives
 - randomization of dynamics noise, sensor noise, and control delay for stronger transfer

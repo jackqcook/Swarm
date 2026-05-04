@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -9,7 +10,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from itertools import combinations, permutations
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".mpl-cache").resolve()))
 import matplotlib
@@ -527,6 +528,7 @@ class PPOConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     reward_scale: float = 0.05
+    bc_kl_coef: float = 0.0
 
 
 class SharedPPO:
@@ -540,6 +542,7 @@ class SharedPPO:
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=self.cfg.critic_lr)
         self.obs_norm = RunningNorm(obs_dim)
         self.state_norm = RunningNorm(state_dim)
+        self.reference_actor: Optional[Actor] = None
 
     def normalize_obs(self, obs: np.ndarray, update: bool) -> np.ndarray:
         if update:
@@ -584,6 +587,25 @@ class SharedPPO:
             value = self.critic(state_tensor)[0]
         return float(value.item())
 
+    def set_schedule(self, actor_lr: float, critic_lr: float, clip_ratio: float, entropy_coef: float, bc_kl_coef: float) -> None:
+        self.cfg.actor_lr = float(actor_lr)
+        self.cfg.critic_lr = float(critic_lr)
+        self.cfg.clip_ratio = float(clip_ratio)
+        self.cfg.entropy_coef = float(entropy_coef)
+        self.cfg.bc_kl_coef = float(bc_kl_coef)
+        for param_group in self.actor_optim.param_groups:
+            param_group["lr"] = self.cfg.actor_lr
+        for param_group in self.critic_optim.param_groups:
+            param_group["lr"] = self.cfg.critic_lr
+
+    def snapshot_reference_actor(self) -> None:
+        reference_actor = Actor(self.actor.net[0].in_features, self.actor.net[-1].out_features).to(self.device)
+        reference_actor.load_state_dict(copy.deepcopy(self.actor.state_dict()))
+        reference_actor.eval()
+        for param in reference_actor.parameters():
+            param.requires_grad_(False)
+        self.reference_actor = reference_actor
+
     def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         obs = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device)
         actions = torch.as_tensor(batch["actions"], dtype=torch.float32, device=self.device)
@@ -597,6 +619,7 @@ class SharedPPO:
         actor_loss_value = 0.0
         critic_loss_value = 0.0
         entropy_value = 0.0
+        retention_kl_value = 0.0
 
         for _ in range(self.cfg.train_epochs):
             indices = torch.randperm(num_samples, device=self.device)
@@ -620,7 +643,19 @@ class SharedPPO:
 
                 values = self.critic(states_mb)
                 critic_loss = ((returns_mb - values) ** 2).mean()
-                loss = actor_loss + self.cfg.value_coef * critic_loss - self.cfg.entropy_coef * entropy
+                retention_kl = torch.zeros((), device=self.device)
+                if self.reference_actor is not None and self.cfg.bc_kl_coef > 0.0:
+                    with torch.no_grad():
+                        reference_dist, _ = self._distribution_from_actor(self.reference_actor, obs_mb)
+                    current_dist, _ = self._distribution(obs_mb)
+                    retention_kl = torch.distributions.kl_divergence(reference_dist, current_dist).sum(dim=-1).mean()
+
+                loss = (
+                    actor_loss
+                    + self.cfg.value_coef * critic_loss
+                    - self.cfg.entropy_coef * entropy
+                    + self.cfg.bc_kl_coef * retention_kl
+                )
 
                 self.actor_optim.zero_grad()
                 self.critic_optim.zero_grad()
@@ -633,12 +668,19 @@ class SharedPPO:
                 actor_loss_value = float(actor_loss.item())
                 critic_loss_value = float(critic_loss.item())
                 entropy_value = float(entropy.item())
+                retention_kl_value = float(retention_kl.item())
 
         return {
             "actor_loss": actor_loss_value,
             "critic_loss": critic_loss_value,
             "entropy": entropy_value,
+            "retention_kl": retention_kl_value,
         }
+
+    def _distribution_from_actor(self, actor: Actor, obs: torch.Tensor) -> Tuple[Normal, torch.Tensor]:
+        mean, log_std = actor(obs)
+        std = log_std.exp()
+        return Normal(mean, std), mean
 
 
 def expert_actions(env: Swarm3DEnv) -> np.ndarray:
@@ -835,6 +877,46 @@ def behavior_clone_actor(
             agent.actor_optim.step()
 
 
+def curriculum_difficulty(episode_idx: int, args: argparse.Namespace) -> float:
+    ramp = min(1.0, episode_idx / max(1, args.curriculum_episodes - 1))
+    if args.curriculum_strategy == "ramp":
+        return ramp
+    if args.curriculum_strategy == "mixed":
+        mixed_floor = float(np.clip(args.curriculum_mixed_floor, 0.0, 1.0))
+        return float(np.random.uniform(low=mixed_floor, high=max(mixed_floor, ramp)))
+    raise ValueError(f"Unsupported curriculum strategy: {args.curriculum_strategy}")
+
+
+def scheduled_value(episode_idx: int, total_episodes: int, start: float, end: float) -> float:
+    if total_episodes <= 1:
+        return float(end)
+    alpha = float(np.clip(episode_idx / max(1, total_episodes - 1), 0.0, 1.0))
+    return float(start + alpha * (end - start))
+
+
+def save_checkpoint(
+    path: Path,
+    agent: SharedPPO,
+    env_cfg: EnvConfig,
+    ppo_cfg: PPOConfig,
+    metadata: Dict,
+) -> None:
+    torch.save(
+        {
+            "actor": agent.actor.state_dict(),
+            "critic": agent.critic.state_dict(),
+            "env_config": asdict(env_cfg),
+            "ppo_config": asdict(ppo_cfg),
+            "obs_norm_mean": agent.obs_norm.mean.tolist(),
+            "obs_norm_var": agent.obs_norm.var.tolist(),
+            "state_norm_mean": agent.state_norm.mean.tolist(),
+            "state_norm_var": agent.state_norm.var.tolist(),
+            "metadata": metadata,
+        },
+        path,
+    )
+
+
 def evaluate(agent: SharedPPO, env_cfg: EnvConfig, episodes: int, generalized: bool) -> Dict[str, float]:
     eval_env = Swarm3DEnv(env_cfg)
     rewards = []
@@ -893,6 +975,7 @@ def plot_training_curves(history: Dict[str, List[float]], out_dir: Path) -> None
     axes[0, 0].plot(history["actor_loss"], label="Actor Loss")
     axes[0, 0].plot(history["critic_loss"], label="Critic Loss")
     axes[0, 0].plot(history["entropy"], label="Entropy")
+    axes[0, 0].plot(history["retention_kl"], label="Retention KL")
     axes[0, 0].set_title("Optimization")
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.3)
@@ -1066,12 +1149,14 @@ def train(args: argparse.Namespace) -> None:
     env_cfg = build_env_config(args)
     train_env = Swarm3DEnv(env_cfg)
     ppo_cfg = PPOConfig(
+        clip_ratio=args.clip_ratio,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         train_epochs=args.ppo_epochs,
         minibatch_size=args.minibatch_size,
         entropy_coef=args.entropy_coef,
         reward_scale=args.reward_scale,
+        bc_kl_coef=args.bc_kl_coef,
     )
     agent = SharedPPO(train_env.obs_dim, train_env.state_dim, 3, ppo_cfg, action_limit=env_cfg.max_accel, device=args.device)
 
@@ -1089,14 +1174,22 @@ def train(args: argparse.Namespace) -> None:
             epochs=args.bc_epochs,
             batch_size=args.bc_batch_size,
         )
+        if args.bc_snapshot_reference:
+            agent.snapshot_reference_actor()
+
+    pretrain_fixed_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=False)
+    pretrain_random_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=True)
 
     output_dir = Path("results") / time.strftime("%Y%m%d-%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = output_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     history: Dict[str, List[float]] = {
         "actor_loss": [],
         "critic_loss": [],
         "entropy": [],
+        "retention_kl": [],
         "train_reward": [],
         "train_episode_length": [],
         "fixed_reward": [],
@@ -1126,9 +1219,45 @@ def train(args: argparse.Namespace) -> None:
     best_rollout = None
     best_fixed_metrics = {}
     best_general_metrics = {}
+    top_checkpoints: List[Dict] = []
+    ppo_phase_start = max(0, args.ppo_phase1_episodes)
+    phase2_enabled = args.ppo_phase2_episodes > 0
+    phase2_allowed = not args.require_phase1_generalization_improvement
+    phase1_gate_checked = False
+    early_stop_reason = ""
 
     for episode in range(args.episodes):
-        difficulty = min(1.0, episode / max(1, args.curriculum_episodes - 1))
+        if phase2_enabled and not phase2_allowed and episode >= ppo_phase_start:
+            early_stop_reason = "phase1_generalization_gate_not_met"
+            break
+
+        if episode < ppo_phase_start:
+            current_phase = "phase1"
+            total_phase_episodes = max(1, args.ppo_phase1_episodes)
+            phase_episode_idx = episode
+            phase_epochs = args.ppo_phase1_epochs
+            clip_ratio = scheduled_value(phase_episode_idx, total_phase_episodes, args.clip_ratio, args.phase1_clip_ratio)
+            entropy_coef = scheduled_value(phase_episode_idx, total_phase_episodes, args.entropy_coef, args.phase1_entropy_coef)
+            bc_kl_coef = scheduled_value(phase_episode_idx, total_phase_episodes, args.bc_kl_coef, args.phase1_bc_kl_coef)
+        else:
+            current_phase = "phase2"
+            total_phase_episodes = max(1, args.ppo_phase2_episodes if phase2_enabled else args.episodes - ppo_phase_start)
+            phase_episode_idx = max(0, episode - ppo_phase_start)
+            phase_epochs = args.ppo_phase2_epochs if phase2_enabled else args.ppo_phase1_epochs
+            clip_ratio = scheduled_value(phase_episode_idx, total_phase_episodes, args.phase1_clip_ratio, args.phase2_clip_ratio)
+            entropy_coef = scheduled_value(phase_episode_idx, total_phase_episodes, args.phase1_entropy_coef, args.phase2_entropy_coef)
+            bc_kl_coef = scheduled_value(phase_episode_idx, total_phase_episodes, args.phase1_bc_kl_coef, args.phase2_bc_kl_coef)
+
+        agent.cfg.train_epochs = int(phase_epochs)
+        agent.set_schedule(
+            actor_lr=args.actor_lr,
+            critic_lr=args.critic_lr,
+            clip_ratio=clip_ratio,
+            entropy_coef=entropy_coef,
+            bc_kl_coef=bc_kl_coef,
+        )
+
+        difficulty = curriculum_difficulty(episode, args)
         trajectories = [
             collect_episode(train_env, agent, deterministic=False, update_norm=True, randomized_env=True, difficulty=difficulty)
             for _ in range(args.rollouts_per_update)
@@ -1144,6 +1273,7 @@ def train(args: argparse.Namespace) -> None:
         history["actor_loss"].append(update_stats["actor_loss"])
         history["critic_loss"].append(update_stats["critic_loss"])
         history["entropy"].append(update_stats["entropy"])
+        history["retention_kl"].append(update_stats["retention_kl"])
         history["train_reward"].append(train_reward)
         history["train_episode_length"].append(train_length)
         history["fixed_reward"].append(fixed_metrics["reward_mean"])
@@ -1175,25 +1305,70 @@ def train(args: argparse.Namespace) -> None:
             best_general_metrics = random_metrics
             rollout_env = Swarm3DEnv(env_cfg)
             best_rollout = collect_episode(rollout_env, agent, deterministic=True, update_norm=False, randomized_env=False, difficulty=1.0)
-            torch.save(
-                {
-                    "actor": agent.actor.state_dict(),
-                    "critic": agent.critic.state_dict(),
-                    "env_config": asdict(env_cfg),
-                    "ppo_config": asdict(ppo_cfg),
-                    "obs_norm_mean": agent.obs_norm.mean.tolist(),
-                    "obs_norm_var": agent.obs_norm.var.tolist(),
-                    "state_norm_mean": agent.state_norm.mean.tolist(),
-                    "state_norm_var": agent.state_norm.var.tolist(),
-                },
+            save_checkpoint(
                 output_dir / "best_model.pt",
+                agent,
+                env_cfg,
+                ppo_cfg,
+                {
+                    "episode": episode + 1,
+                    "phase": current_phase,
+                    "fixed_metrics": fixed_metrics,
+                    "generalization_metrics": random_metrics,
+                    "curriculum_difficulty": difficulty,
+                },
             )
+
+        checkpoint_record = {
+            "episode": episode + 1,
+            "phase": current_phase,
+            "curriculum_difficulty": difficulty,
+            "fixed_metrics": fixed_metrics,
+            "generalization_metrics": random_metrics,
+            "key": list(current_key),
+            "path": str(checkpoints_dir / f"episode_{episode + 1:04d}.pt"),
+        }
+        leaderboard = top_checkpoints + [checkpoint_record]
+        leaderboard = sorted(
+            leaderboard,
+            key=lambda item: tuple(item["key"]),
+            reverse=True,
+        )
+        retained = leaderboard[: max(1, args.top_k_checkpoints)]
+        retained_episodes = {item["episode"] for item in retained}
+        if (episode + 1) in retained_episodes:
+            save_checkpoint(Path(checkpoint_record["path"]), agent, env_cfg, ppo_cfg, checkpoint_record)
+        top_checkpoints = retained
+        retained_paths = {Path(item["path"]).resolve() for item in top_checkpoints}
+        for existing_checkpoint in checkpoints_dir.glob("episode_*.pt"):
+            if existing_checkpoint.resolve() not in retained_paths:
+                existing_checkpoint.unlink(missing_ok=True)
+
+        if (
+            not phase1_gate_checked
+            and phase2_enabled
+            and args.require_phase1_generalization_improvement
+            and (episode + 1) >= ppo_phase_start
+        ):
+            phase1_gate_checked = True
+            random_success_gain = random_metrics["success_rate"] - pretrain_random_metrics["success_rate"]
+            random_completion_gain = random_metrics["completed_fraction"] - pretrain_random_metrics["completed_fraction"]
+            phase2_allowed = bool(
+                random_success_gain >= args.phase1_min_general_success_gain
+                or random_completion_gain >= args.phase1_min_general_completion_gain
+            )
+            if not phase2_allowed:
+                early_stop_reason = "phase1_generalization_gate_not_met"
 
         if (episode + 1) % max(1, args.log_every) == 0:
             print(
                 f"episode={episode + 1} "
+                f"phase={current_phase} "
                 f"difficulty={difficulty:.2f} "
                 f"train_reward={train_reward:.2f} "
+                f"clip={clip_ratio:.3f} "
+                f"entropy={entropy_coef:.4f} "
+                f"bc_kl={bc_kl_coef:.4f} "
                 f"fixed_success={fixed_metrics['success_rate']:.2f} "
                 f"fixed_completion={fixed_metrics['completed_fraction']:.2f} "
                 f"fixed_auc={fixed_metrics['completion_auc']:.2f} "
@@ -1209,6 +1384,9 @@ def train(args: argparse.Namespace) -> None:
         "ppo_config": asdict(ppo_cfg),
         "best_fixed_metrics": best_fixed_metrics,
         "best_generalization_metrics": best_general_metrics,
+        "pretrain_fixed_metrics": pretrain_fixed_metrics,
+        "pretrain_generalization_metrics": pretrain_random_metrics,
+        "top_checkpoints": top_checkpoints,
         "final_fixed_metrics": {
             "reward_mean": history["fixed_reward"][-1],
             "success_rate": history["fixed_success"][-1],
@@ -1227,6 +1405,25 @@ def train(args: argparse.Namespace) -> None:
             "first_completion_step": history["random_first_completion"][-1],
             "completion_auc": history["random_completion_auc"][-1],
         },
+        "training_schedule": {
+            "curriculum_strategy": args.curriculum_strategy,
+            "curriculum_mixed_floor": args.curriculum_mixed_floor,
+            "require_phase1_generalization_improvement": args.require_phase1_generalization_improvement,
+            "phase1_min_general_success_gain": args.phase1_min_general_success_gain,
+            "phase1_min_general_completion_gain": args.phase1_min_general_completion_gain,
+            "ppo_phase1_episodes": args.ppo_phase1_episodes,
+            "ppo_phase2_episodes": args.ppo_phase2_episodes,
+            "ppo_phase1_epochs": args.ppo_phase1_epochs,
+            "ppo_phase2_epochs": args.ppo_phase2_epochs,
+            "phase1_clip_ratio": args.phase1_clip_ratio,
+            "phase2_clip_ratio": args.phase2_clip_ratio,
+            "phase1_entropy_coef": args.phase1_entropy_coef,
+            "phase2_entropy_coef": args.phase2_entropy_coef,
+            "phase1_bc_kl_coef": args.phase1_bc_kl_coef,
+            "phase2_bc_kl_coef": args.phase2_bc_kl_coef,
+        },
+        "phase2_allowed": phase2_allowed,
+        "early_stop_reason": early_stop_reason,
     }
     with open(output_dir / "evaluation_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -1259,17 +1456,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idle-penalty", type=float, default=0.25)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--clip-ratio", type=float, default=0.2)
     parser.add_argument("--ppo-epochs", type=int, default=10)
     parser.add_argument("--minibatch-size", type=int, default=512)
     parser.add_argument("--reward-scale", type=float, default=0.05)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--bc-kl-coef", type=float, default=0.02)
     parser.add_argument("--rollouts-per-update", type=int, default=6)
     parser.add_argument("--curriculum-episodes", type=int, default=120)
+    parser.add_argument("--curriculum-strategy", choices=["ramp", "mixed"], default="mixed")
+    parser.add_argument("--curriculum-mixed-floor", type=float, default=0.2)
     parser.add_argument("--eval-episodes", type=int, default=6)
     parser.add_argument("--bc-episodes", type=int, default=64)
     parser.add_argument("--bc-epochs", type=int, default=12)
     parser.add_argument("--bc-batch-size", type=int, default=1024)
     parser.add_argument("--bc-difficulty", type=float, default=1.0)
+    parser.add_argument("--bc-snapshot-reference", action="store_true", default=True)
+    parser.add_argument("--no-bc-snapshot-reference", action="store_false", dest="bc_snapshot_reference")
+    parser.add_argument("--ppo-phase1-episodes", type=int, default=30)
+    parser.add_argument("--ppo-phase2-episodes", type=int, default=220)
+    parser.add_argument("--ppo-phase1-epochs", type=int, default=4)
+    parser.add_argument("--ppo-phase2-epochs", type=int, default=8)
+    parser.add_argument("--phase1-clip-ratio", type=float, default=0.12)
+    parser.add_argument("--phase2-clip-ratio", type=float, default=0.18)
+    parser.add_argument("--phase1-entropy-coef", type=float, default=0.003)
+    parser.add_argument("--phase2-entropy-coef", type=float, default=0.001)
+    parser.add_argument("--phase1-bc-kl-coef", type=float, default=0.05)
+    parser.add_argument("--phase2-bc-kl-coef", type=float, default=0.01)
+    parser.add_argument("--require-phase1-generalization-improvement", action="store_true", default=True)
+    parser.add_argument("--no-require-phase1-generalization-improvement", action="store_false", dest="require_phase1_generalization_improvement")
+    parser.add_argument("--phase1-min-general-success-gain", type=float, default=0.05)
+    parser.add_argument("--phase1-min-general-completion-gain", type=float, default=0.05)
+    parser.add_argument("--top-k-checkpoints", type=int, default=5)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
