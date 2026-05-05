@@ -7,7 +7,7 @@ import math
 import os
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from itertools import combinations, permutations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -59,6 +59,14 @@ class EnvConfig:
     collision_penalty: float = 0.5
     max_steps: int = 150
     train_obstacle_count_range: Tuple[int, int] = (1, 3)
+    train_action_noise_std: float = 0.06
+    train_velocity_noise_std: float = 0.03
+    train_observation_noise_std: float = 0.01
+    train_control_delay_prob: float = 0.08
+    heldout_action_noise_std: float = 0.1
+    heldout_velocity_noise_std: float = 0.05
+    heldout_observation_noise_std: float = 0.02
+    heldout_control_delay_prob: float = 0.15
     fixed_objectives: Tuple[Tuple[float, float, float], ...] = (
         (-7.0, -4.0, -2.0),
         (-1.5, 3.5, 2.0),
@@ -131,13 +139,15 @@ class Swarm3DEnv:
                 obstacles.append(Obstacle(center=(0.0, 0.0, 0.0), radius=0.0, penalty=0.0, active=False))
         return obstacles
 
-    def reset(self, training: bool = True, difficulty: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    def reset(self, training: bool = True, difficulty: float = 1.0, domain_mode: str = "train") -> Tuple[np.ndarray, np.ndarray]:
         self.training = training
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self.domain_mode = domain_mode
         self.step_idx = 0
         self.completed_objectives = np.zeros(self.cfg.num_objectives, dtype=bool)
         self.cumulative_obstacle_events = 0
         self.obstacle_hits = np.zeros((self.cfg.num_agents, self.max_obstacles), dtype=bool)
+        self.prev_applied_actions = np.zeros((self.cfg.num_agents, 3), dtype=np.float32)
 
         spawn_span = 0.35 + 0.45 * self.difficulty if training else 0.8
         self.agent_positions = self._sample_positions(self.cfg.num_agents, spawn_span)
@@ -158,6 +168,23 @@ class Swarm3DEnv:
         self.prev_assignment_cost = self._coverage_cost()
         self.prev_local_distances = self._assigned_agent_distances(self.current_assignment)
         return self._get_obs(), self._get_state()
+
+    def _domain_noise_params(self) -> Tuple[float, float, float, float]:
+        if self.domain_mode == "train":
+            return (
+                self.cfg.train_action_noise_std,
+                self.cfg.train_velocity_noise_std,
+                self.cfg.train_observation_noise_std,
+                self.cfg.train_control_delay_prob,
+            )
+        if self.domain_mode == "heldout":
+            return (
+                self.cfg.heldout_action_noise_std,
+                self.cfg.heldout_velocity_noise_std,
+                self.cfg.heldout_observation_noise_std,
+                self.cfg.heldout_control_delay_prob,
+            )
+        return (0.0, 0.0, 0.0, 0.0)
 
     def _active_obstacles(self) -> List[Obstacle]:
         return self.obstacles
@@ -302,7 +329,11 @@ class Swarm3DEnv:
                     ]
                 ).astype(np.float32)
             )
-        return np.stack(obs, axis=0)
+        obs_array = np.stack(obs, axis=0)
+        _, _, observation_noise_std, _ = self._domain_noise_params()
+        if observation_noise_std > 0.0:
+            obs_array = obs_array + self.rng.normal(0.0, observation_noise_std, size=obs_array.shape).astype(np.float32)
+        return obs_array.astype(np.float32)
 
     def _get_state(self) -> np.ndarray:
         objective_features = np.column_stack(
@@ -325,7 +356,7 @@ class Swarm3DEnv:
                 ]
             )
 
-        return np.concatenate(
+        state = np.concatenate(
             [
                 self.agent_positions.reshape(-1) / self.cfg.world_size,
                 self.agent_velocities.reshape(-1) / max(self.cfg.max_speed, 1e-6),
@@ -334,6 +365,10 @@ class Swarm3DEnv:
                 np.array(obstacle_features, dtype=np.float32),
             ]
         ).astype(np.float32)
+        _, _, observation_noise_std, _ = self._domain_noise_params()
+        if observation_noise_std > 0.0:
+            state = state + self.rng.normal(0.0, observation_noise_std, size=state.shape).astype(np.float32)
+        return state.astype(np.float32)
 
     @staticmethod
     def _clip_norm(vectors: np.ndarray, max_norm: float) -> np.ndarray:
@@ -349,11 +384,23 @@ class Swarm3DEnv:
 
         prev_cost = self.prev_assignment_cost
         prev_local_distances = dict(self.prev_local_distances)
-        accelerations = self._clip_norm(actions, self.cfg.max_accel)
+        action_noise_std, velocity_noise_std, _, control_delay_prob = self._domain_noise_params()
+        delayed_mask = self.rng.random(self.cfg.num_agents) < control_delay_prob
+        effective_actions = actions.copy()
+        if np.any(delayed_mask):
+            effective_actions[delayed_mask] = self.prev_applied_actions[delayed_mask]
+        self.prev_applied_actions = effective_actions.copy()
+        if action_noise_std > 0.0:
+            effective_actions = effective_actions + self.rng.normal(0.0, action_noise_std, size=effective_actions.shape).astype(np.float32)
+
+        accelerations = self._clip_norm(effective_actions, self.cfg.max_accel)
         self.agent_velocities = self._clip_norm(
             self.agent_velocities + accelerations * self.cfg.dt,
             self.cfg.max_speed,
         )
+        if velocity_noise_std > 0.0:
+            velocity_noise = self.rng.normal(0.0, velocity_noise_std, size=self.agent_velocities.shape).astype(np.float32)
+            self.agent_velocities = self._clip_norm(self.agent_velocities + velocity_noise, self.cfg.max_speed)
         self.agent_positions = self.agent_positions + self.agent_velocities * self.cfg.dt
 
         lower_bound = -self.cfg.world_size
@@ -724,8 +771,9 @@ def collect_episode(
     update_norm: bool = True,
     randomized_env: bool = True,
     difficulty: float = 1.0,
+    domain_mode: str = "train",
 ) -> Dict[str, np.ndarray]:
-    obs, state = env.reset(training=randomized_env, difficulty=difficulty)
+    obs, state = env.reset(training=randomized_env, difficulty=difficulty, domain_mode=domain_mode)
     norm_obs = agent.normalize_obs(obs, update=update_norm)
     norm_state = agent.normalize_state(state, update=update_norm)
 
@@ -917,6 +965,17 @@ def save_checkpoint(
     )
 
 
+def load_checkpoint(path: Path, agent: SharedPPO) -> Dict:
+    checkpoint = torch.load(path, map_location=agent.device)
+    agent.actor.load_state_dict(checkpoint["actor"])
+    agent.critic.load_state_dict(checkpoint["critic"])
+    agent.obs_norm.mean = np.asarray(checkpoint["obs_norm_mean"], dtype=np.float64)
+    agent.obs_norm.var = np.asarray(checkpoint["obs_norm_var"], dtype=np.float64)
+    agent.state_norm.mean = np.asarray(checkpoint["state_norm_mean"], dtype=np.float64)
+    agent.state_norm.var = np.asarray(checkpoint["state_norm_var"], dtype=np.float64)
+    return checkpoint
+
+
 def evaluate(agent: SharedPPO, env_cfg: EnvConfig, episodes: int, generalized: bool) -> Dict[str, float]:
     eval_env = Swarm3DEnv(env_cfg)
     rewards = []
@@ -938,6 +997,7 @@ def evaluate(agent: SharedPPO, env_cfg: EnvConfig, episodes: int, generalized: b
             update_norm=False,
             randomized_env=generalized,
             difficulty=1.0,
+            domain_mode="generalized" if generalized else "fixed",
         )
         info = trajectory["final_info"]
         rewards.append(float(trajectory["episode_return"]))
@@ -969,6 +1029,93 @@ def evaluate(agent: SharedPPO, env_cfg: EnvConfig, episodes: int, generalized: b
     }
 
 
+def build_heldout_suite(env_cfg: EnvConfig, suite_size: int, benchmark_seed: int) -> List[EnvConfig]:
+    rng = np.random.default_rng(benchmark_seed)
+    suite: List[EnvConfig] = []
+    obstacle_slots = len(env_cfg.fixed_obstacles)
+
+    for _ in range(suite_size):
+        objective_span = 0.9 * env_cfg.world_size
+        objectives = tuple(
+            tuple(rng.uniform(-objective_span, objective_span, size=3).astype(np.float32).tolist())
+            for _ in range(env_cfg.num_objectives)
+        )
+        amplitudes = tuple(rng.uniform(14.0, 30.0, size=env_cfg.num_objectives).astype(np.float32).tolist())
+        obstacles: List[Obstacle] = []
+        active_count = int(rng.integers(max(2, obstacle_slots - 1), obstacle_slots + 1))
+        for idx in range(obstacle_slots):
+            if idx < active_count:
+                center = tuple(rng.uniform(-0.85 * env_cfg.world_size, 0.85 * env_cfg.world_size, size=3).astype(np.float32).tolist())
+                radius = float(rng.uniform(1.2, 2.2))
+                penalty = float(rng.uniform(10.0, 18.0))
+                obstacles.append(Obstacle(center=center, radius=radius, penalty=penalty, active=True))
+            else:
+                obstacles.append(Obstacle(center=(0.0, 0.0, 0.0), radius=0.0, penalty=0.0, active=False))
+
+        suite.append(
+            replace(
+                env_cfg,
+                fixed_objectives=objectives,
+                fixed_amplitudes=amplitudes,
+                fixed_obstacles=tuple(obstacles),
+            )
+        )
+    return suite
+
+
+def evaluate_heldout(agent: SharedPPO, env_cfg: EnvConfig, suite_size: int, benchmark_seed: int) -> Dict[str, float]:
+    rewards = []
+    success = []
+    completed_fraction = []
+    obstacle_events = []
+    remaining_costs = []
+    completion_steps = []
+    completed_counts = []
+    first_completion_steps = []
+    success_steps = []
+    completion_auc = []
+
+    for case_cfg in build_heldout_suite(env_cfg, suite_size, benchmark_seed):
+        eval_env = Swarm3DEnv(case_cfg)
+        trajectory = collect_episode(
+            eval_env,
+            agent,
+            deterministic=True,
+            update_norm=False,
+            randomized_env=False,
+            difficulty=1.0,
+            domain_mode="heldout",
+        )
+        info = trajectory["final_info"]
+        rewards.append(float(trajectory["episode_return"]))
+        success.append(float(info["success"]))
+        completed_fraction.append(float(info["completed_fraction"]))
+        obstacle_events.append(float(info["cumulative_obstacle_events"]))
+        remaining_costs.append(float(info["remaining_assignment_cost"]))
+        completion_steps.append(float(trajectory["episode_length"]))
+        completed_counts.append(float(info["completed_count"]))
+        first_completion_steps.append(
+            float(trajectory["first_completion_step"]) if int(trajectory["first_completion_step"]) >= 0 else float(case_cfg.max_steps)
+        )
+        success_steps.append(float(trajectory["episode_length"]) if info["success"] else float(case_cfg.max_steps))
+        cumulative_completed = np.asarray(trajectory["completed_counts"], dtype=np.float32)
+        completion_auc.append(float(np.mean(cumulative_completed / max(case_cfg.num_objectives, 1))))
+
+    return {
+        "reward_mean": float(np.mean(rewards)),
+        "reward_std": float(np.std(rewards)),
+        "success_rate": float(np.mean(success)),
+        "completed_fraction": float(np.mean(completed_fraction)),
+        "completed_count": float(np.mean(completed_counts)),
+        "obstacle_events": float(np.mean(obstacle_events)),
+        "remaining_assignment_cost": float(np.mean(remaining_costs)),
+        "episode_length": float(np.mean(completion_steps)),
+        "first_completion_step": float(np.mean(first_completion_steps)),
+        "success_step": float(np.mean(success_steps)),
+        "completion_auc": float(np.mean(completion_auc)),
+    }
+
+
 def plot_training_curves(history: Dict[str, List[float]], out_dir: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 
@@ -983,14 +1130,17 @@ def plot_training_curves(history: Dict[str, List[float]], out_dir: Path) -> None
     axes[0, 1].plot(history["train_reward"], label="Train Reward")
     axes[0, 1].plot(history["fixed_reward"], label="Fixed Eval Reward")
     axes[0, 1].plot(history["random_reward"], label="Randomized Eval Reward")
+    axes[0, 1].plot(history["heldout_reward"], label="Heldout Eval Reward")
     axes[0, 1].set_title("Reward")
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.3)
 
     axes[1, 0].plot(history["fixed_success"], label="Fixed Success")
     axes[1, 0].plot(history["random_success"], label="Randomized Success")
+    axes[1, 0].plot(history["heldout_success"], label="Heldout Success")
     axes[1, 0].plot(history["fixed_completion"], label="Fixed Completion")
     axes[1, 0].plot(history["random_completion"], label="Randomized Completion")
+    axes[1, 0].plot(history["heldout_completion"], label="Heldout Completion")
     axes[1, 0].set_ylim(0.0, 1.05)
     axes[1, 0].set_title("Task Achievement")
     axes[1, 0].legend()
@@ -998,8 +1148,10 @@ def plot_training_curves(history: Dict[str, List[float]], out_dir: Path) -> None
 
     axes[1, 1].plot(history["fixed_cost"], label="Fixed Remaining Coverage Cost")
     axes[1, 1].plot(history["random_cost"], label="Random Remaining Coverage Cost")
+    axes[1, 1].plot(history["heldout_cost"], label="Heldout Remaining Coverage Cost")
     axes[1, 1].plot(history["fixed_obstacles"], label="Fixed Obstacle Events")
     axes[1, 1].plot(history["random_obstacles"], label="Random Obstacle Events")
+    axes[1, 1].plot(history["heldout_obstacles"], label="Heldout Obstacle Events")
     axes[1, 1].set_title("Safety / Progress Diagnostics")
     axes[1, 1].legend()
     axes[1, 1].grid(alpha=0.3)
@@ -1122,6 +1274,14 @@ def build_env_config(args: argparse.Namespace) -> EnvConfig:
         sequence_completion_bonus=args.sequence_completion_bonus,
         step_penalty=args.step_penalty,
         idle_penalty=args.idle_penalty,
+        train_action_noise_std=args.train_action_noise_std,
+        train_velocity_noise_std=args.train_velocity_noise_std,
+        train_observation_noise_std=args.train_observation_noise_std,
+        train_control_delay_prob=args.train_control_delay_prob,
+        heldout_action_noise_std=args.heldout_action_noise_std,
+        heldout_velocity_noise_std=args.heldout_velocity_noise_std,
+        heldout_observation_noise_std=args.heldout_observation_noise_std,
+        heldout_control_delay_prob=args.heldout_control_delay_prob,
         fixed_objectives=fixed_objectives,
         fixed_amplitudes=fixed_amplitudes,
         fixed_obstacles=fixed_obstacles,
@@ -1131,15 +1291,18 @@ def build_env_config(args: argparse.Namespace) -> EnvConfig:
 def best_metric_tuple(
     fixed_metrics: Dict[str, float],
     general_metrics: Dict[str, float],
-) -> Tuple[float, float, float, float, float, float, float, float]:
+    heldout_metrics: Dict[str, float],
+) -> Tuple[float, float, float, float, float, float, float, float, float, float]:
     return (
-        fixed_metrics["success_rate"],
+        heldout_metrics["success_rate"],
+        heldout_metrics["completed_fraction"],
         general_metrics["success_rate"],
-        fixed_metrics["completed_fraction"],
         general_metrics["completed_fraction"],
-        fixed_metrics["completion_auc"],
+        fixed_metrics["success_rate"],
+        fixed_metrics["completed_fraction"],
+        heldout_metrics["completion_auc"],
         general_metrics["completion_auc"],
-        -fixed_metrics["remaining_assignment_cost"],
+        -heldout_metrics["remaining_assignment_cost"],
         -general_metrics["remaining_assignment_cost"],
     )
 
@@ -1179,6 +1342,7 @@ def train(args: argparse.Namespace) -> None:
 
     pretrain_fixed_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=False)
     pretrain_random_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=True)
+    pretrain_heldout_metrics = evaluate_heldout(agent, env_cfg, args.heldout_suite_size, args.heldout_benchmark_seed)
 
     output_dir = Path("results") / time.strftime("%Y%m%d-%H%M%S")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1194,16 +1358,22 @@ def train(args: argparse.Namespace) -> None:
         "train_episode_length": [],
         "fixed_reward": [],
         "random_reward": [],
+        "heldout_reward": [],
         "fixed_success": [],
         "random_success": [],
+        "heldout_success": [],
         "fixed_completion": [],
         "random_completion": [],
+        "heldout_completion": [],
         "fixed_completed_count": [],
         "random_completed_count": [],
+        "heldout_completed_count": [],
         "fixed_cost": [],
         "random_cost": [],
+        "heldout_cost": [],
         "fixed_obstacles": [],
         "random_obstacles": [],
+        "heldout_obstacles": [],
         "fixed_length": [],
         "random_length": [],
         "fixed_first_completion": [],
@@ -1215,10 +1385,11 @@ def train(args: argparse.Namespace) -> None:
         "curriculum": [],
     }
 
-    best_key = (-math.inf, -math.inf, -math.inf, -math.inf, -math.inf, -math.inf, -math.inf, -math.inf)
+    best_key = tuple([-math.inf] * 10)
     best_rollout = None
     best_fixed_metrics = {}
     best_general_metrics = {}
+    best_heldout_metrics = {}
     top_checkpoints: List[Dict] = []
     ppo_phase_start = max(0, args.ppo_phase1_episodes)
     phase2_enabled = args.ppo_phase2_episodes > 0
@@ -1227,6 +1398,12 @@ def train(args: argparse.Namespace) -> None:
     early_stop_reason = ""
     best_episode = -1
     episodes_since_best = 0
+    best_checkpoint_path = output_dir / "best_model.pt"
+    rollback_count = 0
+    schedule_actor_lr_scale = 1.0
+    schedule_clip_scale = 1.0
+    schedule_entropy_scale = 1.0
+    schedule_bc_kl_scale = 1.0
 
     for episode in range(args.episodes):
         if phase2_enabled and not phase2_allowed and episode >= ppo_phase_start:
@@ -1252,11 +1429,11 @@ def train(args: argparse.Namespace) -> None:
 
         agent.cfg.train_epochs = int(phase_epochs)
         agent.set_schedule(
-            actor_lr=args.actor_lr,
+            actor_lr=args.actor_lr * schedule_actor_lr_scale,
             critic_lr=args.critic_lr,
-            clip_ratio=clip_ratio,
-            entropy_coef=entropy_coef,
-            bc_kl_coef=bc_kl_coef,
+            clip_ratio=clip_ratio * schedule_clip_scale,
+            entropy_coef=entropy_coef * schedule_entropy_scale,
+            bc_kl_coef=bc_kl_coef * schedule_bc_kl_scale,
         )
 
         difficulty = curriculum_difficulty(episode, args)
@@ -1271,6 +1448,7 @@ def train(args: argparse.Namespace) -> None:
         train_length = float(np.mean([traj["episode_length"] for traj in trajectories]))
         fixed_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=False)
         random_metrics = evaluate(agent, env_cfg, args.eval_episodes, generalized=True)
+        heldout_metrics = evaluate_heldout(agent, env_cfg, args.heldout_suite_size, args.heldout_benchmark_seed)
 
         history["actor_loss"].append(update_stats["actor_loss"])
         history["critic_loss"].append(update_stats["critic_loss"])
@@ -1280,16 +1458,22 @@ def train(args: argparse.Namespace) -> None:
         history["train_episode_length"].append(train_length)
         history["fixed_reward"].append(fixed_metrics["reward_mean"])
         history["random_reward"].append(random_metrics["reward_mean"])
+        history["heldout_reward"].append(heldout_metrics["reward_mean"])
         history["fixed_success"].append(fixed_metrics["success_rate"])
         history["random_success"].append(random_metrics["success_rate"])
+        history["heldout_success"].append(heldout_metrics["success_rate"])
         history["fixed_completion"].append(fixed_metrics["completed_fraction"])
         history["random_completion"].append(random_metrics["completed_fraction"])
+        history["heldout_completion"].append(heldout_metrics["completed_fraction"])
         history["fixed_completed_count"].append(fixed_metrics["completed_count"])
         history["random_completed_count"].append(random_metrics["completed_count"])
+        history["heldout_completed_count"].append(heldout_metrics["completed_count"])
         history["fixed_cost"].append(fixed_metrics["remaining_assignment_cost"])
         history["random_cost"].append(random_metrics["remaining_assignment_cost"])
+        history["heldout_cost"].append(heldout_metrics["remaining_assignment_cost"])
         history["fixed_obstacles"].append(fixed_metrics["obstacle_events"])
         history["random_obstacles"].append(random_metrics["obstacle_events"])
+        history["heldout_obstacles"].append(heldout_metrics["obstacle_events"])
         history["fixed_length"].append(fixed_metrics["episode_length"])
         history["random_length"].append(random_metrics["episode_length"])
         history["fixed_first_completion"].append(fixed_metrics["first_completion_step"])
@@ -1300,17 +1484,18 @@ def train(args: argparse.Namespace) -> None:
         history["random_completion_auc"].append(random_metrics["completion_auc"])
         history["curriculum"].append(difficulty)
 
-        current_key = best_metric_tuple(fixed_metrics, random_metrics)
+        current_key = best_metric_tuple(fixed_metrics, random_metrics, heldout_metrics)
         if current_key > best_key:
             best_key = current_key
             best_episode = episode + 1
             episodes_since_best = 0
             best_fixed_metrics = fixed_metrics
             best_general_metrics = random_metrics
+            best_heldout_metrics = heldout_metrics
             rollout_env = Swarm3DEnv(env_cfg)
             best_rollout = collect_episode(rollout_env, agent, deterministic=True, update_norm=False, randomized_env=False, difficulty=1.0)
             save_checkpoint(
-                output_dir / "best_model.pt",
+                best_checkpoint_path,
                 agent,
                 env_cfg,
                 ppo_cfg,
@@ -1319,6 +1504,7 @@ def train(args: argparse.Namespace) -> None:
                     "phase": current_phase,
                     "fixed_metrics": fixed_metrics,
                     "generalization_metrics": random_metrics,
+                    "heldout_metrics": heldout_metrics,
                     "curriculum_difficulty": difficulty,
                 },
             )
@@ -1331,6 +1517,7 @@ def train(args: argparse.Namespace) -> None:
             "curriculum_difficulty": difficulty,
             "fixed_metrics": fixed_metrics,
             "generalization_metrics": random_metrics,
+            "heldout_metrics": heldout_metrics,
             "key": list(current_key),
             "path": str(checkpoints_dir / f"episode_{episode + 1:04d}.pt"),
         }
@@ -1349,6 +1536,21 @@ def train(args: argparse.Namespace) -> None:
         for existing_checkpoint in checkpoints_dir.glob("episode_*.pt"):
             if existing_checkpoint.resolve() not in retained_paths:
                 existing_checkpoint.unlink(missing_ok=True)
+
+        if (
+            args.rollback_patience > 0
+            and episodes_since_best >= args.rollback_patience
+            and rollback_count < args.max_rollbacks
+            and best_episode > 0
+        ):
+            load_checkpoint(best_checkpoint_path, agent)
+            rollback_count += 1
+            schedule_actor_lr_scale *= args.rollback_actor_lr_scale
+            schedule_clip_scale *= args.rollback_clip_ratio_scale
+            schedule_entropy_scale *= args.rollback_entropy_scale
+            schedule_bc_kl_scale *= args.rollback_bc_kl_scale
+            episodes_since_best = 0
+            continue
 
         if args.early_stop_patience > 0 and episodes_since_best >= args.early_stop_patience:
             early_stop_reason = "no_checkpoint_improvement"
@@ -1383,7 +1585,9 @@ def train(args: argparse.Namespace) -> None:
                 f"fixed_completion={fixed_metrics['completed_fraction']:.2f} "
                 f"fixed_auc={fixed_metrics['completion_auc']:.2f} "
                 f"random_success={random_metrics['success_rate']:.2f} "
-                f"random_completion={random_metrics['completed_fraction']:.2f}"
+                f"random_completion={random_metrics['completed_fraction']:.2f} "
+                f"heldout_success={heldout_metrics['success_rate']:.2f} "
+                f"heldout_completion={heldout_metrics['completed_fraction']:.2f}"
             )
 
     plot_training_curves(history, output_dir)
@@ -1394,9 +1598,11 @@ def train(args: argparse.Namespace) -> None:
         "ppo_config": asdict(ppo_cfg),
         "best_fixed_metrics": best_fixed_metrics,
         "best_generalization_metrics": best_general_metrics,
+        "best_heldout_metrics": best_heldout_metrics,
         "best_episode": best_episode,
         "pretrain_fixed_metrics": pretrain_fixed_metrics,
         "pretrain_generalization_metrics": pretrain_random_metrics,
+        "pretrain_heldout_metrics": pretrain_heldout_metrics,
         "top_checkpoints": top_checkpoints,
         "final_fixed_metrics": {
             "reward_mean": history["fixed_reward"][-1],
@@ -1416,6 +1622,13 @@ def train(args: argparse.Namespace) -> None:
             "first_completion_step": history["random_first_completion"][-1],
             "completion_auc": history["random_completion_auc"][-1],
         },
+        "final_heldout_metrics": {
+            "reward_mean": history["heldout_reward"][-1],
+            "success_rate": history["heldout_success"][-1],
+            "completed_fraction": history["heldout_completion"][-1],
+            "completed_count": history["heldout_completed_count"][-1],
+            "remaining_assignment_cost": history["heldout_cost"][-1],
+        },
         "training_schedule": {
             "curriculum_strategy": args.curriculum_strategy,
             "curriculum_mixed_floor": args.curriculum_mixed_floor,
@@ -1432,9 +1645,14 @@ def train(args: argparse.Namespace) -> None:
             "phase2_entropy_coef": args.phase2_entropy_coef,
             "phase1_bc_kl_coef": args.phase1_bc_kl_coef,
             "phase2_bc_kl_coef": args.phase2_bc_kl_coef,
+            "heldout_suite_size": args.heldout_suite_size,
+            "heldout_benchmark_seed": args.heldout_benchmark_seed,
+            "rollback_patience": args.rollback_patience,
+            "max_rollbacks": args.max_rollbacks,
         },
         "phase2_allowed": phase2_allowed,
         "early_stop_reason": early_stop_reason,
+        "rollback_count": rollback_count,
     }
     with open(output_dir / "evaluation_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -1465,6 +1683,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-completion-bonus", type=float, default=140.0)
     parser.add_argument("--step-penalty", type=float, default=0.45)
     parser.add_argument("--idle-penalty", type=float, default=0.25)
+    parser.add_argument("--train-action-noise-std", type=float, default=0.06)
+    parser.add_argument("--train-velocity-noise-std", type=float, default=0.03)
+    parser.add_argument("--train-observation-noise-std", type=float, default=0.01)
+    parser.add_argument("--train-control-delay-prob", type=float, default=0.08)
+    parser.add_argument("--heldout-action-noise-std", type=float, default=0.1)
+    parser.add_argument("--heldout-velocity-noise-std", type=float, default=0.05)
+    parser.add_argument("--heldout-observation-noise-std", type=float, default=0.02)
+    parser.add_argument("--heldout-control-delay-prob", type=float, default=0.15)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--clip-ratio", type=float, default=0.2)
@@ -1498,7 +1724,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-require-phase1-generalization-improvement", action="store_false", dest="require_phase1_generalization_improvement")
     parser.add_argument("--phase1-min-general-success-gain", type=float, default=0.05)
     parser.add_argument("--phase1-min-general-completion-gain", type=float, default=0.05)
+    parser.add_argument("--heldout-suite-size", type=int, default=8)
+    parser.add_argument("--heldout-benchmark-seed", type=int, default=202)
     parser.add_argument("--top-k-checkpoints", type=int, default=5)
+    parser.add_argument("--rollback-patience", type=int, default=30)
+    parser.add_argument("--max-rollbacks", type=int, default=2)
+    parser.add_argument("--rollback-actor-lr-scale", type=float, default=0.5)
+    parser.add_argument("--rollback-clip-ratio-scale", type=float, default=0.8)
+    parser.add_argument("--rollback-entropy-scale", type=float, default=0.8)
+    parser.add_argument("--rollback-bc-kl-scale", type=float, default=1.25)
     parser.add_argument("--early-stop-patience", type=int, default=80)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)

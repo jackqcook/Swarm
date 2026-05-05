@@ -1,0 +1,56 @@
+{
+  "source_run_id": "20260503-202255",
+  "source_episode": 55,
+  "source_checkpoint_path": "results/20260503-202255/checkpoints/episode_0055.pt",
+  "fixed_metrics": {
+    "reward_mean": 1456.9396111526269,
+    "reward_std": 912.6812773184042,
+    "success_rate": 0.3333333333333333,
+    "completed_fraction": 0.4583333333333333,
+    "completed_count": 1.8333333333333333,
+    "obstacle_events": 0.0,
+    "remaining_assignment_cost": 3.2100676695505777,
+    "episode_length": 118.16666666666667,
+    "first_completion_step": 68.16666666666667,
+    "success_step": 118.16666666666667,
+    "completion_auc": 0.19203194479147592
+  },
+  "generalization_metrics": {
+    "reward_mean": 1697.0038172021143,
+    "reward_std": 612.1334508684153,
+    "success_rate": 0.6666666666666666,
+    "completed_fraction": 0.9166666666666666,
+    "completed_count": 3.6666666666666665,
+    "obstacle_events": 0.3333333333333333,
+    "remaining_assignment_cost": 0.4645760456720988,
+    "episode_length": 105.0,
+    "first_completion_step": 18.666666666666668,
+    "success_step": 105.0,
+    "completion_auc": 0.5056926757097244
+  },
+  "heldout_metrics": {
+    "reward_mean": 2780.854956103963,
+    "reward_std": 278.1767034108819,
+    "success_rate": 1.0,
+    "completed_fraction": 1.0,
+    "completed_count": 4.0,
+    "obstacle_events": 0.0,
+    "remaining_assignment_cost": 0.0,
+    "episode_length": 88.0,
+    "first_completion_step": 30.333333333333332,
+    "success_step": 88.0,
+    "completion_auc": 0.32211323579152423
+  },
+  "ranking_key": [
+    1.0,
+    1.0,
+    0.6666666666666666,
+    0.9166666666666666,
+    0.3333333333333333,
+    0.4583333333333333,
+    0.32211323579152423,
+    0.5056926757097244,
+    -0.0,
+    -0.4645760456720988
+  ]
+}
