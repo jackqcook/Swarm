@@ -1,0 +1,35 @@
+# configs/hardware_orin_nano.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — Real hardware: Holybro Pixhawk Jetson Baseboard
+#   - Jetson Orin Nano 8GB (Super Mode, JetPack 6.2+)
+#   - Pixhawk 6C flight controller
+#   - Intel RealSense D435i
+#   - u-blox M9N GPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+mavlink:
+  sitl_address: "udp://:14540"       # Unused when not in sim mode
+  serial_port: "/dev/ttyUSB0"        # Adjust to your baseboard UART mapping
+  baud_rate: 921600                  # High baud for uXRCE-DDS over UART
+  heartbeat_timeout_s: 5
+
+interpreter:
+  model_id: "google/paligemma2-3b-pt-224"
+  device: "cuda"             # Jetson GPU via CUDA
+  quantize: true             # INT4 via bitsandbytes for FP4 equivalent on Jetson
+
+  knowno_tau: 0.60
+  knowno_coverage: 0.85
+
+perception:
+  camera_backend: "realsense"
+  device: "cuda"
+  fps: 30
+  yolo_size: "n"             # YOLOv8n INT8 TensorRT: ~15ms on Orin NX
+  mock_detections: false
+
+planner:
+  safety_radius_m: 6.0
+  max_speed_m_s: 4.0
+  attraction_gain: 0.6
+  repulsion_gain: 2.5

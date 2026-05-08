@@ -1,0 +1,46 @@
+# Swarm — Python Dependencies
+# Stage 1: Single drone, GPS outdoors, text-to-waypoint
+
+# ── Drone control ──────────────────────────────────────────────────────────────
+mavsdk>=2.0.0               # MAVLink drone control (asyncio-native Python SDK)
+pymavlink>=2.4.40           # Low-level MAVLink for direct message inspection
+
+# ── Computer vision & perception ──────────────────────────────────────────────
+ultralytics>=8.2.0          # YOLOv8n obstacle detection
+opencv-python>=4.9.0        # Image capture, preprocessing
+numpy>=1.26.0
+scipy>=1.13.0
+
+# ── VLM inference (Tier 1 interpretation) ─────────────────────────────────────
+transformers>=4.41.0        # HuggingFace: PaliGemma2, SmolVLM, Qwen2-VL
+accelerate>=0.30.0          # Multi-GPU / device-map helpers
+pillow>=10.3.0              # Image loading for VLM input
+torch>=2.3.0                # PyTorch (CPU/CUDA); swap for jetson-specific wheel on-device
+torchvision>=0.18.0
+
+# ── Speech / voice input (optional, Stage 1+) ─────────────────────────────────
+openai-whisper>=20231117    # Local Whisper for voice commands (small/base model on Orin)
+
+# ── Messaging & comms ─────────────────────────────────────────────────────────
+pyzmq>=26.0.0               # ZeroMQ: inter-process and inter-drone messaging
+protobuf>=5.26.0            # For structured message serialization
+
+# ── Config & utils ────────────────────────────────────────────────────────────
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+rich>=13.7.0                # Nice CLI output / status dashboards
+click>=8.1.7                # CLI entry points
+
+# ── GPS & coordinate math ─────────────────────────────────────────────────────
+pyproj>=3.6.0               # Geodetic ↔ local frame conversions
+geographiclib>=2.0          # Vincenty/Karney geodesics
+
+# ── Testing & simulation ──────────────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.0      # Async test support (MAVSDK is asyncio)
+pytest-mock>=3.14.0
+
+# ── Development ───────────────────────────────────────────────────────────────
+black>=24.4.0
+ruff>=0.4.0
+mypy>=1.10.0

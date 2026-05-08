@@ -1,0 +1,41 @@
+# configs/sim_default.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — SITL simulation (no hardware required)
+# Run PX4 SITL with: make px4_sitl gazebo-classic_iris
+# Default MAVSDK SITL address: udp://:14540
+# ─────────────────────────────────────────────────────────────────────────────
+
+mavlink:
+  sitl_address: "udp://:14540"
+  serial_port: "/dev/ttyUSB0"      # Used when --sim is NOT passed
+  baud_rate: 57600
+  heartbeat_timeout_s: 10
+
+interpreter:
+  # Model options (ordered by speed on Jetson Orin Nano 8GB FP4):
+  #   "mock"                                → instant, no GPU, for unit tests
+  #   "vikhyatk/moondream2"                 → fastest real model (~540ms on AGX Orin)
+  #   "HuggingFaceTB/SmolVLM-2B-Instruct"  → balanced
+  #   "google/paligemma2-3b-pt-224"         → best quality on Orin Nano
+  #   "Qwen/Qwen2.5-VL-3B-Instruct"        → best quality overall (needs more RAM)
+  model_id: "mock"
+  device: "cpu"        # "cpu" | "cuda" | "cuda:0" | "mps" (Apple Silicon)
+  quantize: false      # Set true for INT4 on Jetson (requires bitsandbytes)
+
+  # KnowNo ambiguity gating
+  knowno_tau: 0.60         # Confidence threshold for singleton prediction set
+  knowno_coverage: 0.85    # Target empirical coverage (calibration target)
+
+perception:
+  camera_backend: "mock"   # "mock" | "webcam" | "realsense"
+  webcam_id: 0
+  device: "cpu"
+  fps: 15
+  yolo_size: "n"           # "n" (nano) | "s" (small) | "m" (medium)
+  mock_detections: true    # Force mock detections even with real camera
+
+planner:
+  safety_radius_m: 5.0     # Repulsion activates within this distance
+  max_speed_m_s: 3.0
+  attraction_gain: 0.5
+  repulsion_gain: 2.0
