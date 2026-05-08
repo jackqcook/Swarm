@@ -71,7 +71,11 @@ class MavlinkBridge:
         self.connection_string = connection_string
         self.config = config or {}
         self._drone: Optional[object] = None  # mavsdk.System
-        self._mock_mode = not MAVSDK_AVAILABLE
+        # Mock mode is forced if mavsdk is missing OR explicitly requested in
+        # config (mavlink.mock: true). The latter lets you run the full agent
+        # pipeline interactively without PX4 SITL — handy for testing
+        # natural-language commands end-to-end on a laptop.
+        self._mock_mode = (not MAVSDK_AVAILABLE) or bool(self.config.get("mock", False))
         self._position: Optional[DronePosition] = None
         self._velocity: Optional[DroneVelocity] = None
         self._is_armed = False

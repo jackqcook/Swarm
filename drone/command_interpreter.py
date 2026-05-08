@@ -139,10 +139,23 @@ Available actions: fly_to, hover, survey_area, orbit, return, land, follow."""
         if self._loaded:
             return
 
+        # Sentinel: "mock" means use the keyword-heuristic backend without
+        # ever touching transformers / torch / the network.
+        if self.model_id == "mock":
+            logger.info("VLM backend = MOCK (keyword heuristics, no model load).")
+            self._loaded = True
+            return
+
         logger.info("Loading VLM: %s (device=%s, quantize=%s)", self.model_id, self.device, self.quantize)
 
         try:
-            from transformers import AutoProcessor, AutoModelForVision2Seq
+            from transformers import AutoProcessor
+            try:
+                # transformers >= 5.x
+                from transformers import AutoModelForImageTextToText as _AutoVLM
+            except ImportError:
+                # transformers < 5.x
+                from transformers import AutoModelForVision2Seq as _AutoVLM
             import torch
 
             kwargs = {"device_map": self.device}
@@ -151,7 +164,7 @@ Available actions: fly_to, hover, survey_area, orbit, return, land, follow."""
                 kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
 
             self._processor = AutoProcessor.from_pretrained(self.model_id)
-            self._model = AutoModelForVision2Seq.from_pretrained(self.model_id, **kwargs)
+            self._model = _AutoVLM.from_pretrained(self.model_id, **kwargs)
             self._loaded = True
             logger.info("VLM loaded successfully.")
 

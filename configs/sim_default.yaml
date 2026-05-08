@@ -1,8 +1,14 @@
 # configs/sim_default.yaml
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — SITL simulation (no hardware required)
-# Run PX4 SITL with: make px4_sitl gazebo-classic_iris
+# Stage 1 — SITL simulation (no real hardware required, but PX4 SITL must be
+# running). Recommended Mac path:
+#     Terminal 1:  ./scripts/launch_sitl.sh        # PX4 SITL (SIH backend)
+#     Terminal 2:  hawkeye                          # 3D visualizer
+#     Terminal 3:  python -m drone.agent --sim --config configs/sim_default.yaml
 # Default MAVSDK SITL address: udp://:14540
+#
+# For typed-command testing without PX4 installed, use configs/mock_default.yaml
+# instead (sets mavlink.mock: true and skips the MAVSDK connection).
 # ─────────────────────────────────────────────────────────────────────────────
 
 mavlink:
@@ -23,8 +29,13 @@ interpreter:
   quantize: false      # Set true for INT4 on Jetson (requires bitsandbytes)
 
   # KnowNo ambiguity gating
-  knowno_tau: 0.60         # Confidence threshold for singleton prediction set
-  knowno_coverage: 0.85    # Target empirical coverage (calibration target)
+  # NOTE: τ=0.50 is tuned for the *mock* VLM used by this config. The mock
+  # assigns generic fly_to commands p=0.55, so τ=0.60 (the original default)
+  # would clarify every fly_to command. With τ=0.50 they execute. When you
+  # swap in a real VLM (see model_id above), bump τ back up to 0.60 and
+  # calibrate against your own labeled dataset.
+  knowno_tau: 0.50
+  knowno_coverage: 0.85
 
 perception:
   camera_backend: "mock"   # "mock" | "webcam" | "realsense"

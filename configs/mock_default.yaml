@@ -1,0 +1,33 @@
+# configs/mock_default.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure-mock simulation — no PX4 SITL, no Gazebo, no camera.
+# Use this to verify natural-language commands end-to-end on a laptop:
+#   python -m drone.agent --sim --config configs/mock_default.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+mavlink:
+  mock: true                       # ← skip MAVSDK connect; log actions instead
+  sitl_address: "udp://:14540"     # unused in mock mode
+  serial_port: "/dev/ttyUSB0"      # unused in mock mode
+  baud_rate: 57600
+  heartbeat_timeout_s: 10
+
+interpreter:
+  model_id: "mock"                 # keyword-heuristic interpreter (no GPU/network)
+  device: "cpu"
+  quantize: false
+  knowno_tau: 0.50                 # lower than default 0.6 so generic fly_to commands execute
+  knowno_coverage: 0.85
+
+perception:
+  camera_backend: "mock"
+  device: "cpu"
+  fps: 15
+  yolo_size: "n"
+  mock_detections: true
+
+planner:
+  safety_radius_m: 5.0
+  max_speed_m_s: 3.0
+  attraction_gain: 0.5
+  repulsion_gain: 2.0
